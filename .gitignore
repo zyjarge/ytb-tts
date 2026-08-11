@@ -1,0 +1,12 @@
+# 敏感信息:API Key 等,切勿提交
+.env
+.env.*
+
+# 编辑器与运行时状态
+.vscode/
+.omo/
+.codegraph
+
+# 系统文件
+.DS_Store
+*.log
