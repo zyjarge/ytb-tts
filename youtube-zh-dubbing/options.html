@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>YouTube 中文配音 - 设置</title>
+  <style>
+    body {
+      font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      max-width: 560px;
+      margin: 24px auto;
+      padding: 0 16px;
+      color: #1f1f1f;
+    }
+    h1 { font-size: 18px; }
+    h2 { font-size: 14px; margin-top: 24px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
+    .field { margin: 12px 0; }
+    label { display: block; font-size: 13px; margin-bottom: 4px; }
+    input, select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    .hint { font-size: 12px; color: #888; margin-top: 4px; }
+    button.primary {
+      margin-top: 20px;
+      padding: 10px 28px;
+      background: #065fd4;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button.primary:hover { background: #1a6fd8; }
+    #save-status { margin-left: 12px; font-size: 13px; color: #0a7d33; }
+    #save-status.error { color: #c00; }
+  </style>
+</head>
+<body>
+  <h1>YouTube 中文配音 - 设置</h1>
+
+  <h2>MiniMax TTS(语音合成)</h2>
+  <div class="field">
+    <label for="minimaxApiKey">MiniMax API Key</label>
+    <input type="password" id="minimaxApiKey" placeholder="sk-...">
+    <div class="hint">必填。在 platform.minimaxi.com 控制台获取。仅供本机使用,切勿分发。</div>
+  </div>
+  <div class="field">
+    <label for="minimaxGroupId">Group ID(可选)</label>
+    <input type="text" id="minimaxGroupId" placeholder="旧版账号可填,新版无需填写">
+    <div class="hint">新版接口仅用 API Key 认证,旧版账号如有需要可填写。</div>
+  </div>
+  <div class="field">
+    <label for="voiceId">音色</label>
+    <select id="voiceId"></select>
+  </div>
+  <div class="field">
+    <label for="speed">语速(0.5 ~ 2.0)</label>
+    <input type="number" id="speed" min="0.5" max="2.0" step="0.1" value="1.0">
+  </div>
+
+  <h2>翻译 API(OpenAI 兼容)</h2>
+  <div class="field">
+    <label for="translateBaseUrl">接口地址 Base URL</label>
+    <input type="text" id="translateBaseUrl" placeholder="https://api.deepseek.com">
+    <div class="hint">默认 DeepSeek,可填任意 OpenAI 兼容服务的地址。</div>
+  </div>
+  <div class="field">
+    <label for="translateApiKey">API Key</label>
+    <input type="password" id="translateApiKey" placeholder="sk-...">
+  </div>
+  <div class="field">
+    <label for="translateModel">模型</label>
+    <input type="text" id="translateModel" placeholder="deepseek-chat">
+  </div>
+
+  <button class="primary" id="save">保存</button>
+  <span id="save-status"></span>
+
+  <script src="options.js"></script>
+</body>
+</html>
