@@ -2,19 +2,22 @@
  * Service Worker:翻译 + TTS 调度 + 缓存
  *
  * 职责:
- * 1. 接收 Content Script 的 DUB_START / DUB_STOP / DUB_POSITION 消息
- * 2. 维护每个视频的合成任务:翻译(分块)→ TTS(串行队列)→ 推送音频到 Content Script
- * 3. 两级缓存:内存 Map + chrome.storage.local(翻译文本持久化,音频带容量上限的 LRU)
+ * 1. 接收 Content Script 的 DUB_START / DUB_STOP 消息
+ * 2. 流式管线:从当前播放位置开始,按批「翻译 → 合成 → 即时推送 DUB_CUE_READY」,
+ *    页面侧第一句就绪即可开播(由 SyncPlayer 的缓冲机制等待),无需整片合成完;
+ *    全部完成后发送 DUB_ALL_READY 仅作状态通知
+ * 3. 两级缓存:内存 Map + chrome.storage.local(翻译文本持久化,音频带容量上限的 LRU),
+ *    同一视频中断后重开可命中缓存,成本很低
  *
- * 注意:MV3 下 Service Worker 可能随时休眠,任务进度需在每次消息时重建;
- * 合成结果全部通过 chrome.tabs.sendMessage 即时推送,不依赖 SW 长期存活。
+ * 注意:MV3 下 Service Worker 可能随时休眠;合成结果全部通过
+ * chrome.tabs.sendMessage 即时推送,不依赖 SW 长期存活。
  */
 importScripts('lib/translate.js', 'lib/minimax_tts.js');
 
 'use strict';
 
-const PREFETCH_AHEAD = 10;              // 预生成窗口:领先当前播放位置 10 句
 const TRANSLATE_BATCH = 25;             // 每批翻译句数
+const FIRST_BATCH = 5;                  // 首批小批量翻译:缩短"开口"延迟
 const AUDIO_CACHE_LIMIT = 4 * 1024 * 1024; // 音频持久化缓存上限 4MB(配额为 10MB,留余量)
 
 // 任务表:videoId → 任务对象
@@ -83,17 +86,16 @@ async function setAudioBase64(key, base64) {
   await chrome.storage.local.set({ [key]: base64 });
 }
 
-/** Blob → base64 字符串 */
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result; // data:audio/mpeg;base64,xxx
-      resolve(String(result).split(',')[1] || '');
-    };
-    reader.onerror = () => reject(new Error('Blob 转 Base64 失败'));
-    reader.readAsDataURL(blob);
-  });
+/**
+ * Blob → base64 字符串
+ * 注意:Service Worker 环境没有 FileReader(window API),必须用 Blob.arrayBuffer + btoa
+ */
+async function blobToBase64(blob) {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 /**
@@ -109,10 +111,13 @@ async function handleStart(msg, sender) {
     return { ok: false, error: '请先在设置页填写 MiniMax API Key' };
   }
 
-  // 停止旧的同视频任务
-  if (tasks.has(msg.videoId)) {
-    tasks.get(msg.videoId).stopped = true;
-    tasks.delete(msg.videoId);
+  // 停止该标签页上的所有旧任务(含上一个视频的:SPA 切换后旧任务若不停止,
+  // 会继续空烧 TTS 配额并推送旧视频音频)
+  for (const [vid, t] of tasks) {
+    if (t.tabId === tabId) {
+      t.stopped = true;
+      tasks.delete(vid);
+    }
   }
 
   const task = {
@@ -120,15 +125,15 @@ async function handleStart(msg, sender) {
     tabId,
     cues: msg.cues,
     options,
+    startIndex: typeof msg.startIndex === 'number' ? msg.startIndex : 0,
     stopped: false,
-    translatedUpTo: 0,    // 已翻译到的 index(不含)
-    targetIndex: Math.min(PREFETCH_AHEAD, msg.cues.length), // 预生成目标
-    positionIndex: 0,     // Content Script 报告的最新播放位置
   };
   tasks.set(msg.videoId, task);
+  console.log('[ytb-tts] 任务启动:', msg.videoId, '共', msg.cues.length, '句');
 
   // 流水线在后台推进,不阻塞响应
   runPipeline(task).catch((e) => {
+    console.error('[ytb-tts] 流水线异常:', e);
     pushError(task, e);
   });
 
@@ -144,69 +149,66 @@ function handleStop(msg) {
   return { ok: true };
 }
 
-/** 播放位置更新:推进预生成窗口 */
-function handlePosition(msg) {
-  const task = tasks.get(msg.videoId);
-  if (task) {
-    task.positionIndex = msg.index;
-    task.targetIndex = Math.min(Math.max(msg.index + PREFETCH_AHEAD, 0), task.cues.length);
-  }
-  return { ok: true };
-}
-
-/** 主流水线:翻译 + 合成 + 推送 */
+/**
+ * 主流水线(流式):
+ * 处理顺序:从当前播放位置对应的句子(startIndex)开始向后,最后回填前面的
+ * 句子(seek 回开头也能播)。每批先翻译再逐句合成并即时推送,页面侧边收边播。
+ * 阶段 3:全部推送完后发 DUB_ALL_READY,仅作状态通知(不影响开播时机)
+ */
 async function runPipeline(task) {
-  const { cues, videoId } = task;
+  const { cues, videoId, options } = task;
+  const startPos = Math.max(0, Math.min(task.startIndex, cues.length));
+  const ordered = cues.slice(startPos).concat(cues.slice(0, startPos));
 
-  while (!task.stopped) {
-    const translateTarget = Math.min(task.targetIndex, cues.length);
+  let from = 0;
+  while (from < ordered.length && !task.stopped) {
+    const batchSize = from === 0 ? FIRST_BATCH : TRANSLATE_BATCH;
+    const slice = ordered.slice(from, from + batchSize);
+    from += batchSize;
 
-    // 阶段 1:推进翻译(分块,先查缓存)
-    while (!task.stopped && task.translatedUpTo < translateTarget) {
-      const from = task.translatedUpTo;
-      const to = Math.min(from + TRANSLATE_BATCH, translateTarget);
-      const slice = cues.slice(from, to);
-
-      const needTranslate = [];
-      for (const cue of slice) {
-        const cached = await getTranslation(videoId, cue.index);
-        if (cached) {
-          cue.zh = cached;
-        } else {
-          needTranslate.push(cue);
-        }
+    // 翻译本批(先查缓存)
+    const needTranslate = [];
+    for (const cue of slice) {
+      const cached = await getTranslation(videoId, cue.index);
+      if (cached) {
+        cue.zh = cached;
+      } else {
+        needTranslate.push(cue);
       }
-
-      if (needTranslate.length > 0) {
-        const batch = needTranslate.map((c) => c.text);
-        const results = await Translate.translateBatch(batch, {
-          baseUrl: task.options.translateBaseUrl,
-          apiKey: task.options.translateApiKey,
-          model: task.options.translateModel,
-        });
-        needTranslate.forEach((cue, i) => {
-          cue.zh = results[i];
-          setTranslation(videoId, cue.index, results[i]).catch(() => {});
-        });
-      }
-      task.translatedUpTo = to;
     }
 
-    // 阶段 2:合成 [0, translateTarget) 内已翻译未合成的句子
-    await advanceSynthesis(task, translateTarget);
+    if (needTranslate.length > 0) {
+      const batch = needTranslate.map((c) => c.text);
+      const results = await Translate.translateBatch(batch, {
+        baseUrl: options.translateBaseUrl,
+        apiKey: options.translateApiKey,
+        model: options.translateModel,
+      });
+      needTranslate.forEach((cue, i) => {
+        cue.zh = results[i];
+        setTranslation(videoId, cue.index, results[i]).catch(() => {});
+      });
+    }
 
-    if (task.translatedUpTo >= cues.length && cues.every((c) => c.audioSent)) break;
-    await sleep(500);
+    // 合成并即时推送本批
+    await advanceSynthesis(task, slice);
+  }
+
+  // 阶段 3:通知全部就绪
+  if (!task.stopped) {
+    console.log('[ytb-tts] 全部句子已推送:', videoId, '共', cues.length, '句');
+    chrome.tabs
+      .sendMessage(task.tabId, { type: 'DUB_ALL_READY', videoId, total: cues.length })
+      .catch(() => {});
   }
 }
 
-/** 合成 [0, limit) 内已翻译且未发送的句子(每次全量扫描,幂等) */
-async function advanceSynthesis(task, limit) {
-  const { cues, videoId, options, tabId } = task;
-  limit = Math.min(limit, cues.length);
+/** 合成 list 中已翻译且未发送的句子并推送(幂等) */
+async function advanceSynthesis(task, list) {
+  const { videoId, options, tabId } = task;
 
-  for (let i = 0; i < limit && !task.stopped; i++) {
-    const cue = cues[i];
+  for (const cue of list) {
+    if (task.stopped) break;
     if (!cue.zh || cue.audioSent) continue;
 
     const aKey = audioKey(videoId, cue.index, options);
@@ -225,6 +227,7 @@ async function advanceSynthesis(task, limit) {
     }
 
     cue.audioSent = true;
+    console.log('[ytb-tts] 推送音频:', videoId, 'index =', cue.index, base64 ? '' : '(空)');
     chrome.tabs
       .sendMessage(tabId, {
         type: 'DUB_CUE_READY',
@@ -248,10 +251,6 @@ function pushError(task, err) {
     .catch(() => {});
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 /* ---------------- 消息路由 ---------------- */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
@@ -260,8 +259,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return await handleStart(msg, sender);
       case 'DUB_STOP':
         return handleStop(msg);
-      case 'DUB_POSITION':
-        return handlePosition(msg);
       default:
         return { ok: false, error: '未知消息类型' };
     }

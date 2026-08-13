@@ -13,10 +13,12 @@
 (function () {
   'use strict';
 
+  // 域名顺序:实测 2026-08 起 api.minimaxi.chat 对新版 key 返回 2049 invalid,
+  // 新 key 只认 api.minimaxi.com / api-bj.minimaxi.com,故 .com 优先
   const ENDPOINTS = [
-    'https://api.minimaxi.chat/v1/t2a_v2',
     'https://api.minimaxi.com/v1/t2a_v2',
     'https://api-bj.minimaxi.com/v1/t2a_v2',
+    'https://api.minimaxi.chat/v1/t2a_v2',
   ];
   const DEFAULT_MODEL = 'speech-2.8-turbo';
   const DEFAULT_VOICE = 'male-qn-qingse';

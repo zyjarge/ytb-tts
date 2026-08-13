@@ -3,7 +3,9 @@
   "name": "YouTube 中文配音",
   "version": "0.1.0",
   "description": "将 YouTube 视频英文字幕实时翻译并合成中文语音,与原画面同步播放,提升观看学习效率",
-  "permissions": ["storage"],
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
     "*://www.youtube.com/*",
     "https://api.minimaxi.chat/*",
@@ -11,22 +13,35 @@
     "https://api-bj.minimaxi.com/*",
     "https://api.deepseek.com/*"
   ],
-  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["*://www.youtube.com/*"],
-      "js": ["injected.js"],
-      "run_at": "document_start",
-      "world": "MAIN"
-    },
+      "matches": [
+        "*://www.youtube.com/*"
+      ],
+      "js": [
+        "lib/subtitles.js",
+        "lib/syncplayer.js",
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
     {
-      "matches": ["*://www.youtube.com/*"],
-      "js": ["lib/subtitles.js", "lib/syncplayer.js", "content.js"],
-      "run_at": "document_idle",
-      "world": "ISOLATED"
+      "resources": [
+        "injected.js",
+        "icons/button.png"
+      ],
+      "matches": [
+        "*://www.youtube.com/*"
+      ]
     }
   ],
   "options_page": "options.html",
