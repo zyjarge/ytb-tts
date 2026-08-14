@@ -11,7 +11,10 @@
     "https://api.minimaxi.chat/*",
     "https://api.minimaxi.com/*",
     "https://api-bj.minimaxi.com/*",
-    "https://api.deepseek.com/*"
+    "https://api.deepseek.com/*",
+    "*://*.minimaxi.com/*",
+    "*://*.minimaxi.chat/*",
+    "*://*.minimax.chat/*"
   ],
   "optional_host_permissions": [
     "https://*/*",
