@@ -24,25 +24,81 @@
 
   /* ---------------- ytInitialPlayerResponse 回传 ---------------- */
 
-  /** 当前页面的视频 ID(watch 页 URL 的 v 参数;非 watch 页返回 null) */
+  /** 当前页面的视频 ID(watch 页取 v 参数;Shorts 页取 /shorts/{id};其他页返回 null) */
   function currentPageVideoId() {
     try {
-      return new URL(location.href).searchParams.get('v');
+      const u = new URL(location.href);
+      if (u.pathname.indexOf('/shorts/') === 0) {
+        return u.pathname.split('/')[2] || null;
+      }
+      return u.searchParams.get('v');
     } catch (e) {
       return null;
     }
   }
 
-  /** 读取并回传 ytInitialPlayerResponse 的关键字段,成功返回 true */
-  function sendPlayerResponse() {
-    const data = window.ytInitialPlayerResponse;
-    if (!data || !data.videoDetails || !data.videoDetails.videoId) {
-      return false;
+  /**
+   * 当前激活的播放器 API 元素(供字幕轨道 setOption 等)。
+   * Shorts 滚动后页面会存在多个 #movie_player(相邻 reel 预加载),
+   * 且新版 reel 没有 is-active 属性;先取"可视面积最大的 video"
+   * (与 content.js 同一判定),再定位到同 reel 内的 #movie_player
+   */
+  function getActivePlayer() {
+    const videos = Array.from(document.querySelectorAll('video.html5-main-video'));
+    let best = null;
+    let bestArea = 0;
+    for (const v of videos) {
+      const r = v.getBoundingClientRect();
+      const w = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+      const h = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+      if (w * h > bestArea) {
+        bestArea = w * h;
+        best = v;
+      }
     }
-    // SPA 切换视频的瞬间,ytInitialPlayerResponse 可能还是上一个视频的数据,
-    // 必须与当前页面 URL 的视频 ID 一致才回传,否则 Content Script 会拿到陈旧字幕
+    if (best) {
+      const reel = best.closest ? best.closest('ytd-reel-video-renderer') : null;
+      if (reel) {
+        const p = reel.querySelector('#movie_player');
+        if (p) return p;
+      }
+      const direct = best.closest ? best.closest('#movie_player') : null;
+      if (direct) return direct;
+    }
+    return document.getElementById('movie_player');
+  }
+
+  /**
+   * 读取当前视频的 playerResponse。
+   * 优先用 ytInitialPlayerResponse;Shorts 滚动切换时它不一定随之更新,
+   * 此时改从激活播放器实例的 getPlayerResponse() 取
+   */
+  function readPlayerData() {
     const pageId = currentPageVideoId();
-    if (pageId && data.videoDetails.videoId !== pageId) {
+    const initial = window.ytInitialPlayerResponse;
+    if (initial && initial.videoDetails && initial.videoDetails.videoId &&
+        (!pageId || initial.videoDetails.videoId === pageId)) {
+      return initial;
+    }
+    try {
+      const player = getActivePlayer();
+      if (player && typeof player.getPlayerResponse === 'function') {
+        const pr = player.getPlayerResponse();
+        if (pr && pr.videoDetails && pr.videoDetails.videoId &&
+            (!pageId || pr.videoDetails.videoId === pageId)) {
+          return pr;
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 读取并回传当前视频 playerResponse 的关键字段,成功返回 true */
+  function sendPlayerResponse() {
+    // SPA/Shorts 切换视频的瞬间,数据可能还是上一个视频的;
+    // readPlayerData 只在与页面 URL 视频一致时才返回,否则 Content Script 会拿到陈旧字幕
+    const data = readPlayerData();
+    if (!data) {
       return false;
     }
     const tracks =
@@ -199,7 +255,7 @@
       return;
     }
 
-    const player = document.getElementById('movie_player');
+    const player = getActivePlayer();
     if (!player || typeof player.setOption !== 'function') return;
     try {
       if (typeof player.loadModule === 'function') player.loadModule('captions');
@@ -239,7 +295,7 @@
   /** 恢复用户开启配音前的字幕轨道状态 */
   function restoreCaptions() {
     if (!prevTrackSaved) return;
-    const player = document.getElementById('movie_player');
+    const player = getActivePlayer();
     if (player && typeof player.setOption === 'function') {
       try {
         player.setOption('captions', 'track', prevTrack || {});

@@ -89,11 +89,20 @@
       '.ytb-tts-player-btn:hover img{opacity:1}',
       '.ytb-tts-player-btn.ytb-tts-active img{opacity:1;filter:drop-shadow(0 0 3px #3ea6ff)}',
       '.ytb-tts-player-btn[aria-disabled="true"]{opacity:.5;pointer-events:none}',
-      '#ytb-tts-status{position:absolute;top:12px;left:12px;z-index:30;padding:4px 10px;',
+      // Shorts 页无控制栏:圆形浮动按钮,挂在播放器右上角(避开顶部标题区);
+      // z-index 60 压过播放器错误层 .ytp-error(44)
+      '.ytb-tts-player-btn.ytb-tts-shorts-btn{position:absolute;top:56px;right:12px;',
+      'z-index:60;width:40px;height:40px;border:none;border-radius:50%;',
+      'background:rgba(0,0,0,.55);cursor:pointer}',
+      '.ytb-tts-player-btn.ytb-tts-shorts-btn:hover{background:rgba(0,0,0,.75)}',
+      '.ytb-tts-player-btn.ytb-tts-shorts-btn img{width:22px;height:22px}',
+      // 层级必须压过播放器错误层 .ytp-error(z-index:44,实测 Shorts 会遮挡我们)
+      '#ytb-tts-status{position:absolute;top:12px;left:12px;z-index:60;padding:4px 10px;',
       'border-radius:4px;background:rgba(0,0,0,.7);color:#fff;font-size:13px;',
       'pointer-events:none;display:none}',
-      // 加载浮层:暂停期间的视觉提示(转圈+文字),pointer-events:none 不挡控制栏
-      '#ytb-tts-loading{position:absolute;inset:0;z-index:40;display:none;',
+      // 加载浮层:暂停期间的视觉提示(转圈+文字),pointer-events:none 不挡控制栏;
+      // 层级低于按钮(60),保证加载中按钮仍可点击取消
+      '#ytb-tts-loading{position:absolute;inset:0;z-index:59;display:none;',
       'flex-direction:column;align-items:center;justify-content:center;gap:14px;',
       'background:rgba(0,0,0,.35);pointer-events:none}',
       '.ytb-tts-spinner{width:36px;height:36px;border:3px solid rgba(255,255,255,.25);',
@@ -106,29 +115,44 @@
     return true;
   }
 
-  /** 状态浮层挂在 #movie_player 内(跟随播放器,全屏/影院模式均可见) */
+  /** 状态浮层挂在当前激活播放器内(跟随播放器,全屏/影院模式均可见) */
   function ensureStatus() {
-    const player = document.getElementById('movie_player');
-    if (!player) return false;
-    if (!document.getElementById(STATUS_ID)) {
-      const el = document.createElement('div');
+    let el = document.getElementById(STATUS_ID);
+    if (!el) {
+      el = document.createElement('div');
       el.id = STATUS_ID;
-      player.appendChild(el);
     }
-    return true;
+    // Shorts 滚动换 reel 后激活播放器会变,浮层跟着搬家
+    return mountInPlayer(el);
   }
 
   /**
-   * 把配音按钮嵌入播放器右下控制栏(.ytp-right-controls 最左侧,
-   * 紧邻设置/全屏等原生按钮),与商业插件同一位置
+   * 注入配音按钮:
+   * - watch 页:嵌入播放器右下控制栏(.ytp-right-controls 最左侧),
+   *   与设置/全屏等原生按钮同排,与商业插件同一位置
+   * - Shorts 页:无右下控制栏,改为挂在激活 reel 播放器右上角的圆形浮动按钮
    */
   function injectButton() {
     injectStyles(); // 每次重试都补样式(root 早先可能不存在)
-    if (document.querySelector('.' + BTN_CLASS)) {
-      return ensureStatus(); // 按钮还在,只补状态浮层(播放器可能被重建)
+    // Shorts 页 DOM 里也存在 .ytp-right-controls,但 chrome-bottom 整体是 0x0 隐藏的,
+    // 必须实际可见才用控制栏,否则改用浮动按钮
+    const controlsRaw = document.querySelector('.ytp-right-controls');
+    const controls = controlsRaw && controlsRaw.getBoundingClientRect().width > 0
+      ? controlsRaw : null;
+    const player = getPlayerContainer();
+
+    const existing = document.querySelector('.' + BTN_CLASS);
+    if (existing) {
+      // YouTube 重建控制栏 / Shorts 滚动换 reel 后,按钮可能挂错位置,搬家修正
+      if (controls) {
+        existing.classList.remove('ytb-tts-shorts-btn');
+        if (existing.parentNode !== controls) controls.insertBefore(existing, controls.firstChild);
+      } else if (isShortsPage() && player) {
+        existing.classList.add('ytb-tts-shorts-btn');
+        if (existing.closest('#movie_player') !== player) player.appendChild(existing);
+      }
+      return ensureStatus();
     }
-    const controls = document.querySelector('.ytp-right-controls');
-    if (!controls) return false;
 
     const btn = document.createElement('button');
     btn.className = 'ytp-button ' + BTN_CLASS;
@@ -141,9 +165,17 @@
     img.alt = '';
     btn.appendChild(img);
     btn.addEventListener('click', onToggleClick);
-    controls.insertBefore(btn, controls.firstChild);
 
-    return ensureStatus();
+    if (controls) {
+      controls.insertBefore(btn, controls.firstChild);
+      return ensureStatus();
+    }
+    if (isShortsPage() && player) {
+      btn.classList.add('ytb-tts-shorts-btn');
+      player.appendChild(btn);
+      return ensureStatus();
+    }
+    return false;
   }
 
   /**
@@ -151,16 +183,15 @@
    * 用于"点击后暂停加载"与"播放中缓冲"两种暂停场景的视觉提示
    */
   function showLoadingOverlay(text) {
-    const player = document.getElementById('movie_player');
-    if (!player) return;
     let el = document.getElementById(LOADING_ID);
     if (!el) {
       el = document.createElement('div');
       el.id = LOADING_ID;
       el.innerHTML =
         '<div class="ytb-tts-spinner"></div><div class="ytb-tts-loading-text"></div>';
-      player.appendChild(el);
     }
+    // 挂到当前激活播放器(Shorts 换 reel 时跟随搬家);播放器未就绪则暂不显示
+    if (!mountInPlayer(el)) return;
     el.querySelector('.ytb-tts-loading-text').textContent = text || '';
     el.style.display = 'flex';
   }
@@ -580,14 +611,71 @@
   }
 
   function getVideoElement() {
-    return document.querySelector('video.html5-main-video') ||
-      document.querySelector('#movie_player video');
+    const videos = Array.from(document.querySelectorAll('video.html5-main-video'));
+    if (!videos.length) return document.querySelector('#movie_player video');
+    if (videos.length === 1) return videos[0];
+    // Shorts 会预加载相邻 reel,页面同时存在多个 video:取可视面积最大的(当前在播的)
+    let best = null;
+    let bestArea = 0;
+    for (const v of videos) {
+      const r = v.getBoundingClientRect();
+      const w = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+      const h = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+      const area = w * h;
+      if (area > bestArea) {
+        bestArea = area;
+        best = v;
+      }
+    }
+    return best || videos[0];
   }
 
-  /** 当前页面的视频 ID(watch 页 URL 的 v 参数;非 watch 页返回 null) */
+  /**
+   * 当前激活视频所属的播放器容器。
+   * watch 页:video 祖先里的 #movie_player(有实际尺寸);
+   * Shorts 页:#movie_player 与 video 无祖先关系且本身 0x0 隐藏(实测),
+   * 此时沿 video 祖先链找第一个有实际尺寸的容器(即 #shorts-player)
+   */
+  function getPlayerContainer() {
+    const video = getVideoElement();
+    if (video) {
+      const mp = video.closest ? video.closest('#movie_player') : null;
+      if (mp && mp.getBoundingClientRect().width > 0) return mp;
+      let el = video.parentElement;
+      while (el && el !== document.body) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          // 浮层需要绝对定位锚点;static 容器补 relative(尺寸不变,不影响布局)
+          if (getComputedStyle(el).position === 'static') el.style.position = 'relative';
+          return el;
+        }
+        el = el.parentElement;
+      }
+    }
+    return document.getElementById('movie_player');
+  }
+
+  /** 把元素挂到当前激活播放器内(已挂在别处则搬家),返回是否成功 */
+  function mountInPlayer(el) {
+    const player = getPlayerContainer();
+    if (!player) return false;
+    if (el.parentNode !== player) player.appendChild(el);
+    return true;
+  }
+
+  /** 当前是否为 Shorts 页 */
+  function isShortsPage() {
+    return location.pathname.indexOf('/shorts/') === 0;
+  }
+
+  /** 当前页面的视频 ID(watch 页取 v 参数;Shorts 页取 /shorts/{id};其他页返回 null) */
   function getCurrentVideoId() {
     try {
-      return new URL(location.href).searchParams.get('v');
+      const u = new URL(location.href);
+      if (u.pathname.indexOf('/shorts/') === 0) {
+        return u.pathname.split('/')[2] || null;
+      }
+      return u.searchParams.get('v');
     } catch (e) {
       return null;
     }
@@ -610,7 +698,7 @@
   /** 广告检测:播放器进入 ad-showing 时暂停配音调度 */
   function watchAds() {
     if (adObserver) adObserver.disconnect();
-    const moviePlayer = document.querySelector('#movie_player');
+    const moviePlayer = getPlayerContainer();
     if (!moviePlayer) return;
     adObserver = new MutationObserver(() => {
       const inAd = moviePlayer.classList.contains('ad-showing');
@@ -633,7 +721,8 @@
    * (injectButton 幂等:按钮已存在时只补状态浮层,开销极小)
    */
   function ensureInjected() {
-    if (location.pathname.indexOf('/watch') !== 0) return;
+    if (location.pathname.indexOf('/watch') !== 0 &&
+        location.pathname.indexOf('/shorts/') !== 0) return;
     injectButton();
   }
   ensureInjected();
