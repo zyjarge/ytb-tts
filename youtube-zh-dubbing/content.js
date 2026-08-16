@@ -346,7 +346,7 @@
 
   async function onToggleClick() {
     console.log('[ytb-tts] 配音按钮被点击, 当前状态:', state);
-    if (!isContextValid()) {
+    if (!DubCommon.isContextValid()) {
       setState('error');
       setStatus('扩展已更新,请刷新页面后重试', '#c00');
       return;
@@ -431,7 +431,7 @@
     video.removeEventListener('volumechange', onVolumeChange);
     video.addEventListener('volumechange', onVolumeChange);
 
-    const resp = await safeSendMessage({
+    const resp = await DubCommon.safeSendMessage({
       type: 'DUB_START',
       videoId: activeVideoId,
       startIndex,
@@ -492,7 +492,7 @@
 
   async function stopDubbing() {
     const wasLoading = state === 'loading';
-    safeSendMessage({ type: 'DUB_STOP', videoId: activeVideoId });
+    DubCommon.safeSendMessage({ type: 'DUB_STOP', videoId: activeVideoId });
     clearTimeout(loadingWatchdog);
     loadingWatchdog = null;
     hideLoadingOverlay();
@@ -535,7 +535,7 @@
         if (msg.videoId !== activeVideoId) return;
         if (cueAudioCache.has(msg.index)) return;
         try {
-          const bytes = base64ToBytes(msg.base64);
+          const bytes = DubCommon.base64ToBytes(msg.base64);
           const blob = new Blob([bytes], { type: 'audio/mpeg' });
           const url = URL.createObjectURL(blob);
           cueAudioCache.set(msg.index, { url, duration: 0 });
@@ -550,7 +550,7 @@
       case 'DUB_CHUNK_READY': {
         // 合并块:整段音频 + 每句时间区间,切分回逐句 WAV 后入缓存
         if (msg.videoId !== activeVideoId) return;
-        handleChunk(msg).catch((e) => console.error('[ytb-tts] 合并音频切分失败:', e));
+        chunkHandler(msg).catch((e) => console.error('[ytb-tts] 合并音频切分失败:', e));
         break;
       }
       case 'DUB_ALL_READY': {
@@ -591,99 +591,19 @@
     };
   }
 
-  /* ---------------- 合并块音频切分 ---------------- */
+  /* ---------------- 合并块音频切分(共享实现见 lib/dubcommon.js) ---------------- */
 
-  let sharedAudioCtx = null; // 解码复用的 AudioContext(decodeAudioData 不要求 running 状态)
-
-  /**
-   * 处理合并块:解码整段 mp3,按句级时间区间切成逐句 WAV 入缓存。
-   * 在页面上下文做切分是因为 Service Worker 没有可用的音频解码 API
-   */
-  async function handleChunk(msg) {
-    const bytes = base64ToBytes(msg.base64);
-    if (!sharedAudioCtx) {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      sharedAudioCtx = new AC();
-    }
-    // decodeAudioData 会 detach 输入 buffer,必须传副本
-    const audioBuffer = await sharedAudioCtx.decodeAudioData(bytes.buffer.slice(0));
-    const sr = audioBuffer.sampleRate;
-    let added = 0;
-    for (const seg of msg.segments || []) {
-      if (cueAudioCache.has(seg.index)) continue;
-      const startFrame = Math.max(0, Math.floor(seg.begin * sr));
-      const endFrame = Math.min(audioBuffer.length, Math.ceil(seg.end * sr));
-      if (endFrame - startFrame < sr * 0.05) continue; // 不足 50ms 视为空句
-      const wav = encodeWav(audioBuffer, startFrame, endFrame);
-      const url = URL.createObjectURL(wav);
-      cueAudioCache.set(seg.index, { url, duration: (endFrame - startFrame) / sr });
-      added++;
-    }
-    console.log('[ytb-tts] 合并音频切分完成:新增', added, '句 (已缓存', cueAudioCache.size, '句)');
-    if (state === 'loading') checkInitialBuffer(); // 驱动首批缓冲进度
-  }
-
-  /** AudioBuffer 的 [startFrame, endFrame) 区间编码为 PCM16 WAV Blob */
-  function encodeWav(audioBuffer, startFrame, endFrame) {
-    const numCh = audioBuffer.numberOfChannels;
-    const sr = audioBuffer.sampleRate;
-    const frames = endFrame - startFrame;
-    const dataSize = frames * numCh * 2;
-    const buf = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buf);
-    const writeStr = (off, s) => {
-      for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
-    };
-    writeStr(0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true);
-    writeStr(8, 'WAVE');
-    writeStr(12, 'fmt ');
-    view.setUint32(16, 16, true);          // fmt 块大小
-    view.setUint16(20, 1, true);           // PCM
-    view.setUint16(22, numCh, true);
-    view.setUint32(24, sr, true);
-    view.setUint32(28, sr * numCh * 2, true); // 字节率
-    view.setUint16(32, numCh * 2, true);      // 块对齐
-    view.setUint16(34, 16, true);             // 位深
-    writeStr(36, 'data');
-    view.setUint32(40, dataSize, true);
-    const channels = [];
-    for (let c = 0; c < numCh; c++) channels.push(audioBuffer.getChannelData(c));
-    let off = 44;
-    for (let f = startFrame; f < endFrame; f++) {
-      for (let c = 0; c < numCh; c++) {
-        const s = Math.max(-1, Math.min(1, channels[c][f]));
-        view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-        off += 2;
-      }
-    }
-    return new Blob([buf], { type: 'audio/wav' });
-  }
+  const chunkHandler = DubCommon.createChunkHandler({
+    getCache: () => cueAudioCache,
+    onProgress: () => {
+      if (state === 'loading') checkInitialBuffer(); // 驱动首批缓冲进度
+    },
+  });
 
   /* ---------------- 辅助 ---------------- */
 
-  /**
-   * 安全发送消息到 Background。
-   * 扩展被重新加载后,旧 Content Script 上下文失效,chrome.runtime.sendMessage
-   * 会【同步抛出】Error: Extension context invalidated(此时 .catch 接不住),
-   * 必须 try/catch 包裹,静默忽略,避免页面控制台刷 Uncaught 错误。
-   */
-  function safeSendMessage(msg) {
-    try {
-      return Promise.resolve(chrome.runtime.sendMessage(msg)).catch(() => {});
-    } catch (e) {
-      return Promise.resolve();
-    }
-  }
-
-  /** 扩展上下文是否仍然有效(用于残留脚本自检) */
-  function isContextValid() {
-    try {
-      return !!chrome.runtime && !!chrome.runtime.id;
-    } catch (e) {
-      return false;
-    }
-  }
+  // safeSendMessage / isContextValid / base64ToBytes / 音频切分:
+  // 统一由 lib/dubcommon.js 的 DubCommon 提供
 
   function getVideoElement() {
     const videos = Array.from(document.querySelectorAll('video.html5-main-video'));
@@ -761,13 +681,6 @@
     if (state !== 'active') return;
     const video = getVideoElement();
     if (video && !video.muted) video.muted = true;
-  }
-
-  function base64ToBytes(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
   }
 
   /** 广告检测:播放器进入 ad-showing 时暂停配音调度 */

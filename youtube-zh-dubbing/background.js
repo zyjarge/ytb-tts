@@ -14,7 +14,7 @@
  * 注意:MV3 下 Service Worker 可能随时休眠;合成结果全部通过
  * chrome.tabs.sendMessage 即时推送,不依赖 SW 长期存活。
  */
-importScripts('lib/translate.js', 'lib/minimax_tts.js');
+importScripts('lib/translate.js', 'lib/minimax_tts.js', 'lib/wbi.js');
 
 'use strict';
 
@@ -136,6 +136,8 @@ async function handleStart(msg, sender) {
     cues: msg.cues,
     options,
     startIndex: typeof msg.startIndex === 'number' ? msg.startIndex : 0,
+    // B 站等场景:字幕已是中文(ai-zh),跳过翻译直接 TTS
+    skipTranslate: !!msg.skipTranslate,
     stopped: false,
   };
   tasks.set(msg.videoId, task);
@@ -176,28 +178,34 @@ async function runPipeline(task) {
     const slice = ordered.slice(from, from + batchSize);
     from += batchSize;
 
-    // 翻译本批(先查缓存)
-    const needTranslate = [];
-    for (const cue of slice) {
-      const cached = await getTranslation(videoId, cue.index);
-      if (cached) {
-        cue.zh = cached;
-      } else {
-        needTranslate.push(cue);
+    // 翻译本批(先查缓存);skipTranslate 模式(B 站中文字幕)直接使用原文
+    if (task.skipTranslate) {
+      for (const cue of slice) {
+        if (!cue.zh) cue.zh = cue.text;
       }
-    }
+    } else {
+      const needTranslate = [];
+      for (const cue of slice) {
+        const cached = await getTranslation(videoId, cue.index);
+        if (cached) {
+          cue.zh = cached;
+        } else {
+          needTranslate.push(cue);
+        }
+      }
 
-    if (needTranslate.length > 0) {
-      const batch = needTranslate.map((c) => c.text);
-      const results = await Translate.translateBatch(batch, {
-        baseUrl: options.translateBaseUrl,
-        apiKey: options.translateApiKey,
-        model: options.translateModel,
-      });
-      needTranslate.forEach((cue, i) => {
-        cue.zh = results[i];
-        setTranslation(videoId, cue.index, results[i]).catch(() => {});
-      });
+      if (needTranslate.length > 0) {
+        const batch = needTranslate.map((c) => c.text);
+        const results = await Translate.translateBatch(batch, {
+          baseUrl: options.translateBaseUrl,
+          apiKey: options.translateApiKey,
+          model: options.translateModel,
+        });
+        needTranslate.forEach((cue, i) => {
+          cue.zh = results[i];
+          setTranslation(videoId, cue.index, results[i]).catch(() => {});
+        });
+      }
     }
 
     // 合成并即时推送本批
@@ -422,6 +430,60 @@ function pushError(task, err) {
     .catch(() => {});
 }
 
+/**
+ * 取 B 站播放器信息(x/player/wbi/v2,wbi 签名)。
+ * 官方播放器走 wbi 签名接口;免签名的 x/player/v2 会被风控返回"脏数据"
+ * (字幕轨道张冠李戴,实测返回过 LOL / 股市等毫不相干视频的字幕)
+ */
+async function handleBiliPlayerV2(msg) {
+  try {
+    // 官方播放器传 aid+cid;只传 bvid 的响应形态不同,尽量贴齐官方
+    const params = { cid: msg.cid };
+    if (msg.aid) params.aid = msg.aid;
+    else params.bvid = msg.bvid;
+    const query = await BiliWbi.sign(
+      params,
+      (url) => fetch(url, { credentials: 'include' })
+    );
+    const resp = await fetch('https://api.bilibili.com/x/player/wbi/v2?' + query, {
+      credentials: 'include',
+    });
+    const text = await resp.text();
+    return { ok: resp.ok, status: resp.status, text };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+}
+
+/**
+ * 代取 B 站资源(供 bilibili.js 使用)。
+ * Content Script 跨域 fetch api.bilibili.com / aisubtitle.hdslb.com 受 CORS 限制
+ * (实测报 Failed to fetch);Service Worker 携带 host_permissions 不受 CORS 约束,
+ * credentials:'include' 会带上用户登录 cookie(字幕接口要求登录态)。
+ * 仅允许 bilibili.com / hdslb.com 域名,防止被滥用为任意代理。
+ */
+async function handleBiliFetch(msg) {
+  const url = msg.url || '';
+  let host = '';
+  try {
+    host = new URL(url).host;
+  } catch (e) {
+    return { ok: false, error: '非法 URL' };
+  }
+  const allowed = host.endsWith('.bilibili.com') || host === 'bilibili.com' ||
+    host.endsWith('.hdslb.com') || host === 'hdslb.com';
+  if (!allowed || !url.startsWith('https://')) {
+    return { ok: false, error: '不允许的域名' };
+  }
+  try {
+    const resp = await fetch(url, { credentials: 'include' });
+    const text = await resp.text();
+    return { ok: resp.ok, status: resp.status, text };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+}
+
 /* ---------------- 消息路由 ---------------- */
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
@@ -430,6 +492,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return await handleStart(msg, sender);
       case 'DUB_STOP':
         return handleStop(msg);
+      case 'BILI_FETCH':
+        return await handleBiliFetch(msg);
+      case 'BILI_PLAYER_V2':
+        return await handleBiliPlayerV2(msg);
       default:
         return { ok: false, error: '未知消息类型' };
     }

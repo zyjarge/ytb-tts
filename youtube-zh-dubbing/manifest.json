@@ -14,7 +14,9 @@
     "https://api.deepseek.com/*",
     "*://*.minimaxi.com/*",
     "*://*.minimaxi.chat/*",
-    "*://*.minimax.chat/*"
+    "*://*.minimax.chat/*",
+    "*://api.bilibili.com/*",
+    "*://*.hdslb.com/*"
   ],
   "optional_host_permissions": [
     "https://*/*",
@@ -31,9 +33,21 @@
       "js": [
         "lib/subtitles.js",
         "lib/syncplayer.js",
+        "lib/dubcommon.js",
         "content.js"
       ],
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://www.bilibili.com/video/*"
+      ],
+      "js": [
+        "lib/syncplayer.js",
+        "lib/dubcommon.js",
+        "bilibili.js"
+      ],
+      "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
@@ -43,7 +57,8 @@
         "icons/button.png"
       ],
       "matches": [
-        "*://www.youtube.com/*"
+        "*://www.youtube.com/*",
+        "*://www.bilibili.com/*"
       ]
     }
   ],
