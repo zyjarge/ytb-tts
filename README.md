@@ -1,6 +1,8 @@
-# ytb-tts — YouTube 中文配音
+# ytb-tts — YouTube / B 站中文配音
 
-把 YouTube 英文视频**实时配上中文语音**的 Chrome 扩展（MV3)：抓取视频自带字幕 → 批量翻译为中文（DeepSeek 等 OpenAI 兼容服务）→ MiniMax TTS 逐句合成 → 按时间戳与原画面同步播放，原声自动静音。
+把英文视频**实时配上中文语音**的 Chrome 扩展（MV3)：抓取视频字幕 → 翻译为中文（YouTube 走 DeepSeek;B 站 AI 字幕已是中文则直通）→ MiniMax TTS 逐句合成 → 按时间戳与原画面同步播放，原声自动静音。
+
+**支持站点**:YouTube（普通视频 + Shorts，需英文 CC/ASR 字幕）、B 站（`/video/` 播放页，需登录，需 ai-zh 中文 AI 字幕）。
 
 ## 快速开始
 
@@ -27,15 +29,18 @@
 ├── PRD.md                 # 产品需求文档(MVP 范围、技术架构、验收标准)
 └── youtube-zh-dubbing/    # Chrome 扩展(MV3)
     ├── manifest.json
-    ├── background.js      # Service Worker:流式翻译 + TTS 调度 + 持久缓存
-    ├── content.js         # Content Script:播放器内嵌按钮、加载浮层、字幕抓取
-    ├── injected.js        # 主世界脚本:hook 播放器带 pot 的字幕请求
+    ├── background.js      # Service Worker:流式翻译(可跳过)+ TTS 合并调度 + 持久缓存
+    ├── content.js         # YouTube Content Script:播放器内嵌按钮、加载浮层、字幕抓取
+    ├── injected.js        # YouTube 主世界脚本:hook 播放器带 pot 的字幕请求
+    ├── bilibili.js        # B 站 Content Script:字幕 API(wbi 签名)、ai-zh 直通、分 P 巡检
     ├── options.html/js    # 设置页(API Key、音色、语速)
     └── lib/
-        ├── subtitles.js   # timedtext JSON3 解析、片段合并、轨道选择
+        ├── subtitles.js   # YouTube timedtext JSON3 解析、片段合并、轨道选择
         ├── translate.js   # OpenAI 兼容翻译封装(分块、按行对应)
-        ├── minimax_tts.js # MiniMax TTS 封装(hex 解码、限流自适应队列)
-        └── syncplayer.js  # 时间戳对齐播放引擎(双向调速/尾部对齐/缓冲等待)
+        ├── minimax_tts.js # MiniMax TTS 封装(hex 解码、限流自适应队列、多句合并+句级字幕)
+        ├── syncplayer.js  # 时间戳对齐播放引擎(双向调速/尾部对齐/缓冲等待,两站共用)
+        ├── dubcommon.js   # 站点无关公共件(base64/WAV 编码、合并块切分、安全消息)
+        └── wbi.js         # B 站 wbi 签名(内置 MD5)
 ```
 
 ## 合规说明
