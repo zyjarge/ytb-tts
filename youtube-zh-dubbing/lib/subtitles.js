@@ -114,6 +114,27 @@
   }
 
   /**
+   * 选择中文字幕轨道(用于跳过翻译直通 TTS)
+   * 优先级:简体中文人工 → 简体中文 ASR → 其他中文(繁中等)人工 → 其他中文 ASR
+   * @param {Array} tracks extractCaptionTracks 的结果
+   * @returns {object|null} 选中的轨道,或 null(无中文字幕)
+   */
+  function selectChineseTrack(tracks) {
+    if (!tracks || tracks.length === 0) return null;
+    const isZh = (t) => t && /^zh([-_]|$)/i.test(t.languageCode || '');
+    const zhTracks = tracks.filter(isZh);
+    if (zhTracks.length === 0) return null;
+    const score = (t) => {
+      const l = (t.languageCode || '').toLowerCase();
+      let s = 0;
+      if (l === 'zh-hans' || l === 'zh-cn' || l === 'zh') s += 2; // 简体优先
+      if (t.kind !== 'asr') s += 1;                              // 人工优先
+      return s;
+    };
+    return zhTracks.slice().sort((a, b) => score(b) - score(a))[0];
+  }
+
+  /**
    * 构造 timedtext 抓取 URL:强制 JSON3 格式并明确语言
    * @param {object} track extractCaptionTracks 中的一项
    */
@@ -130,6 +151,7 @@
     assignIndexes,
     extractCaptionTracks,
     selectTrack,
+    selectChineseTrack,
     buildTimedTextUrl,
   };
 })();

@@ -4,14 +4,15 @@
  * 职责:
  * 1. 在 YouTube 视频页注入「中文配音」按钮与状态提示
  * 2. 接收 injected.js(主世界)回传的 ytInitialPlayerResponse 信息
- * 3. 点击按钮:立即暂停视频并展示加载浮层(转圈+进度文案),抓取英文字幕 →
+ * 3. 点击按钮:立即暂停视频并展示加载浮层(转圈+进度文案),抓取字幕 →
  *    发 DUB_START(含当前播放位置 startIndex)给 Background → 流式模式:Background
- *    从当前位置开始按批翻译+合成并逐句推送;首批缓冲(起始句起连续 3 句)就绪后
- *    自动收起浮层并续播,后续句子边合成边播(中途某句未就绪时 SyncPlayer 暂停
+ *    从当前位置开始按批翻译(如需)+合成并逐句推送;首批缓冲(起始句起连续 3 句)
+ *    就绪后自动收起浮层并续播,后续句子边合成边播(中途某句未就绪时 SyncPlayer 暂停
  *    视频缓冲等待,同样显示加载浮层);加载中再点按钮 = 取消
- *    字幕抓取说明:YouTube 对 timedtext 接口强制 pot(PO Token)校验,裸 baseUrl 只会
- *    返回 200 空响应;因此主路径是让主世界的 injected.js 开启播放器 CC 轨道,
- *    借播放器自己带 pot 的字幕请求拿到数据(直接请求仅作兜底)
+ *    字幕三级通道:原生中文字幕轨(直通 TTS)> 英文轨 + tlang 自动翻译(直通)>
+ *    英文轨 + DeepSeek(质量兜底);YouTube 对 timedtext 接口强制 pot(PO Token)校验,
+ *    裸 baseUrl 只会返回 200 空响应;因此主路径是让主世界的 injected.js 开启播放器
+ *    CC 轨道,借播放器自己带 pot 的字幕请求拿到数据(直接请求仅作兜底)
  * 4. 接收 DUB_CUE_READY 音频并缓存;DUB_ALL_READY 仅作状态通知;DUB_ERROR 做状态流转
  * 5. 处理:静音原声、seek 位置同步、广告暂停、SPA 导航重置
  */
@@ -244,6 +245,13 @@
 
   /* ---------------- 字幕抓取 ---------------- */
 
+  /**
+   * 抓取字幕,三级通道(优先级从高到低):
+   * 1. 原生中文字幕轨 → 直通 TTS,跳过 DeepSeek
+   * 2. 英文轨 + 借带 pot 的 URL 改 tlang=zh-Hans 重取 YouTube 机器自动翻译 → 直通 TTS
+   * 3. 英文轨原文 → DeepSeek 翻译(质量最高,兜底)
+   * @returns {Promise<{cues: Array, skipTranslate: boolean, route: string}>}
+   */
   async function fetchSubtitles() {
     if (!playerInfo) throw new Error('未获取到播放器数据,请刷新页面重试');
     // 防御:playerInfo 必须对应当前页面视频(SPA 切换后可能有陈旧数据残留)
@@ -252,13 +260,18 @@
       throw new Error('播放器数据尚未切换完成,请稍后再点击「中文配音」');
     }
     const tracks = Subtitles.extractCaptionTracks({ captions: { playerCaptionsTracklistRenderer: { captionTracks: playerInfo.captionTracks } } });
-    const track = Subtitles.selectTrack(tracks);
-    if (!track) throw new Error('该视频无可用英文字幕');
+    const zhTrack = Subtitles.selectChineseTrack(tracks);
+    const enTrack = Subtitles.selectTrack(tracks);
+    if (!zhTrack && !enTrack) throw new Error('该视频无可用字幕(需中文或英文)');
+    const track = zhTrack || enTrack;
 
     let json = null;
+    let capturedUrl = null;
     try {
-      // 主路径:借播放器带 pot 的 timedtext 请求获取字幕
-      json = await fetchCaptionsViaPlayer(playerInfo.videoId, track);
+      // 主路径:借播放器带 pot 的 timedtext 请求获取字幕(含完整 URL)
+      const cap = await fetchCaptionsViaPlayer(playerInfo.videoId, track);
+      json = cap.json;
+      capturedUrl = cap.url;
     } catch (e) {
       // 兜底:直接请求 baseUrl(YouTube 未强制 pot 的环境仍可用)
       json = await fetchCaptionsDirect(track);
@@ -267,15 +280,48 @@
       window.postMessage({ source: CMD_SOURCE, type: CMD_TYPE, cmd: 'restore-captions' }, '*');
     }
 
+    if (zhTrack) {
+      return { cues: parseToCues(json), skipTranslate: true, route: '中文字幕轨' };
+    }
+    // 英文轨:先试 YouTube 机器自动翻译(tlang),不可用再回退 DeepSeek
+    if (capturedUrl) {
+      try {
+        const zhJson = await fetchTranslatedCaptions(capturedUrl, 'zh-Hans');
+        return { cues: parseToCues(zhJson), skipTranslate: true, route: 'YouTube 自动翻译' };
+      } catch (e) {
+        console.warn('[ytb-tts] 自动翻译字幕不可用,回退英文 + DeepSeek:', (e && e.message) || e);
+      }
+    }
+    return { cues: parseToCues(json), skipTranslate: false, route: '英文 + DeepSeek' };
+  }
+
+  /** timedtext JSON → 合并后的带 index 句子序列;内容为空时抛错 */
+  function parseToCues(json) {
     const parsed = Subtitles.parseTimedText(json);
     if (parsed.length === 0) throw new Error('字幕内容为空');
-    const merged = Subtitles.mergeCues(parsed);
-    return Subtitles.assignIndexes(merged);
+    return Subtitles.assignIndexes(Subtitles.mergeCues(parsed));
+  }
+
+  /**
+   * 借带 pot 的字幕 URL 改参数重取 YouTube 机器自动翻译(tlang)字幕。
+   * 时间轴与原轨道一致,文本为谷歌机翻中文
+   */
+  async function fetchTranslatedCaptions(potUrl, tlang) {
+    const u = new URL(potUrl);
+    u.searchParams.set('fmt', 'json3');
+    u.searchParams.set('tlang', tlang);
+    const resp = await fetch(u.toString(), { credentials: 'include' });
+    if (!resp.ok) throw new Error(`自动翻译字幕请求失败(HTTP ${resp.status})`);
+    const text = await resp.text();
+    if (!text.trim()) throw new Error('自动翻译字幕返回空内容');
+    return JSON.parse(text);
   }
 
   /**
    * 主世界协同抓取:让播放器开启英文字幕轨道,
-   * 捕获 injected.js hook 到的带 pot 参数的 timedtext 响应
+   * 捕获 injected.js hook 到的带 pot 参数的 timedtext 响应。
+   * 返回 { json, url }:json 为解析后的字幕数据,url 为带 pot 的完整请求 URL
+   * (供 tlang 自动翻译重取使用)
    */
   function fetchCaptionsViaPlayer(videoId, track) {
     return new Promise((resolve, reject) => {
@@ -295,7 +341,7 @@
         if (d.data.url.indexOf('lang=') !== -1 && d.data.url.indexOf('lang=' + lang) === -1) return;
         cleanup();
         try {
-          resolve(JSON.parse(d.data.body));
+          resolve({ json: JSON.parse(d.data.body), url: d.data.url });
         } catch (e) {
           reject(new Error('字幕数据解析失败'));
         }
@@ -384,7 +430,8 @@
     showLoadingOverlay('正在抓取字幕...');
 
     const dubVideoId = playerInfo ? playerInfo.videoId : null; // fetchSubtitles 会再校验
-    cues = await fetchSubtitles();
+    const sub = await fetchSubtitles();
+    cues = sub.cues;
 
     // 抓取字幕期间页面可能已切换到新视频(SPA 导航):playerInfo 会被导航监听重置
     // 或更新为新视频,任一不一致都放弃本次启动,避免给新视频配旧视频的音
@@ -393,8 +440,9 @@
         (pageIdAfterFetch && pageIdAfterFetch !== dubVideoId)) {
       throw new Error('页面视频已切换,请重新点击「中文配音」');
     }
-    setStatus(`共 ${cues.length} 句,启动流水线...`);
-    showLoadingOverlay(`共 ${cues.length} 句,语音合成中...`);
+    console.log('[ytb-tts] 字幕通道:', sub.route, '| 共', cues.length, '句');
+    setStatus(`共 ${cues.length} 句(${sub.route}),启动流水线...`);
+    showLoadingOverlay(`共 ${cues.length} 句(${sub.route}),语音合成中...`);
 
     activeVideoId = dubVideoId;
     cueAudioCache = new Map();
@@ -435,6 +483,7 @@
       type: 'DUB_START',
       videoId: activeVideoId,
       startIndex,
+      skipTranslate: sub.skipTranslate, // 中文字幕轨/自动翻译通道:跳过 DeepSeek 直通 TTS
       cues: cues.map((c) => ({ index: c.index, start: c.start, end: c.end, text: c.text })),
     });
     if (!resp || !resp.ok) {
