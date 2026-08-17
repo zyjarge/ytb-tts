@@ -118,10 +118,13 @@
   }
 
   /**
-   * 合并合成:多句文本(换行分隔)一次请求,开启句级字幕。
+   * 合并合成:多句文本(换行分隔)一次请求,开启字幕服务。
    * 限流按请求次数计费按字符,合并后吞吐成倍提升而成本不变。
-   * @returns {Promise<{blob: Blob, subtitles: Array<{text, begin, end}>}>}
-   *   blob 为整段 mp3;subtitles 为句级时间戳(秒),供调用方切分回逐句
+   * 字幕粒度优先词级(word):切分边界可对齐到词边界,避免句级插值
+   * 把句尾半个词切掉(吞字);词级不可用时自动降级句级(sentence)
+   * @returns {Promise<{blob: Blob, subtitles: Array<{text, begin, end}>, granularity: string}>}
+   *   blob 为整段 mp3;subtitles 为时间戳(秒),供调用方切分回逐句;
+   *   granularity 为实际使用的字幕粒度('word' | 'sentence')
    */
   async function synthesizeChunk(text, { apiKey, groupId, voiceId, speed, model }) {
     if (!apiKey) throw new Error('MiniMax API Key 未配置,请在设置页填写');
@@ -132,34 +135,37 @@
       if (groupId) {
         url += `?GroupId=${encodeURIComponent(groupId)}`;
       }
-      const body = {
-        model: model || DEFAULT_MODEL,
-        text,
-        stream: false,
-        voice_setting: {
-          voice_id: voiceId || DEFAULT_VOICE,
-          speed: typeof speed === 'number' ? speed : 1.0,
-          vol: 1.0,
-          pitch: 0,
-        },
-        audio_setting: {
-          format: 'mp3',
-          sample_rate: 32000,
-          bitrate: 128000,
-        },
-        subtitle_enable: true,
-        subtitle_type: 'sentence',
-      };
+      for (const subtitleType of ['word', 'sentence']) {
+        const body = {
+          model: model || DEFAULT_MODEL,
+          text,
+          stream: false,
+          voice_setting: {
+            voice_id: voiceId || DEFAULT_VOICE,
+            speed: typeof speed === 'number' ? speed : 1.0,
+            vol: 1.0,
+            pitch: 0,
+          },
+          audio_setting: {
+            format: 'mp3',
+            sample_rate: 32000,
+            bitrate: 128000,
+          },
+          subtitle_enable: true,
+          subtitle_type: subtitleType,
+        };
 
-      try {
-        const json = await _requestOnce(url, body, apiKey);
-        const subUrl = json.data && json.data.subtitle_file;
-        if (!subUrl) throw new Error('TTS 响应缺少 subtitle_file(无法切分合并音频)');
-        const subtitles = await fetchSubtitles(subUrl);
-        return { blob: audioBlobOf(json), subtitles };
-      } catch (e) {
-        lastError = e;
-        if (e.isRateLimit || e.isAuthError) throw e;
+        try {
+          const json = await _requestOnce(url, body, apiKey);
+          const subUrl = json.data && json.data.subtitle_file;
+          if (!subUrl) throw new Error('TTS 响应缺少 subtitle_file(无法切分合并音频)');
+          const subtitles = await fetchSubtitles(subUrl);
+          return { blob: audioBlobOf(json), subtitles, granularity: subtitleType };
+        } catch (e) {
+          lastError = e;
+          if (e.isRateLimit || e.isAuthError) throw e;
+          // 其他错误(如该模型不支持词级字幕):降级粒度/换域名重试
+        }
       }
     }
     throw lastError || new Error('TTS 合并合成失败');

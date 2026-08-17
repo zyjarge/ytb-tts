@@ -49,9 +49,9 @@ function audioKey(videoId, index, options) {
   return `audio:${videoId}:${options.voiceId || 'default'}:${options.speed || 1}:${index}`;
 }
 
-/** 合并块缓存 key:以首尾句 index 标识一个块 */
+/** 合并块缓存 key:以首尾句 index 标识一个块;v2 = 词级对齐(旧 key 作废,防吞字段落复用) */
 function chunkKey(videoId, chunk, options) {
-  return `chunk:${videoId}:${options.voiceId || 'default'}:${options.speed || 1}:` +
+  return `chunk:v2:${videoId}:${options.voiceId || 'default'}:${options.speed || 1}:` +
     `${chunk[0].index}-${chunk[chunk.length - 1].index}`;
 }
 
@@ -339,14 +339,14 @@ async function synthesizeChunkAndPush(task, chunk) {
 
   try {
     const text = chunk.map((c) => c.zh).join('\n'); // 官方约定:段落用换行符分隔
-    const { blob, subtitles } = await ttsQueue.enqueueChunk(text, {
+    const { blob, subtitles, granularity } = await ttsQueue.enqueueChunk(text, {
       apiKey: options.minimaxApiKey,
       groupId: options.minimaxGroupId,
       voiceId: options.voiceId,
       speed: options.speed,
       model: options.ttsModel,
     });
-    const segments = alignSegments(chunk, subtitles);
+    const segments = alignSegments(chunk, subtitles, granularity);
     if (!segments) throw new Error('字幕与句子对齐失败');
     const base64 = await blobToBase64(blob);
     setAudioBase64(cKey, JSON.stringify({ base64, segments })).catch(() => {});
@@ -374,12 +374,15 @@ function pushChunk(task, chunk, base64, segments) {
 }
 
 /**
- * 把 MiniMax 句级字幕时间戳对齐到我们的句子块。
- * 字幕分句与我们句子的边界可能不同(字幕每句 ≤50 字,且 MiniMax 会做文本规范化),
- * 因此按字符位置比例映射:整段文本第 N 个字符 → 落在字幕第几句 → 句内按比例插值时间
+ * 把 MiniMax 字幕时间戳对齐到我们的句子块。
+ * 字幕分句与我们句子的边界可能不同(字幕句 ≤50 字,且 MiniMax 会做文本规范化),
+ * 因此按字符位置比例映射:整段文本第 N 个字符 → 落在字幕第几条 → 条内按比例插值时间。
+ * 词级(word)字幕不做条内插值:边界位置直接对齐到所在词的结束时刻
+ * (内部边界为相邻两句共享,句尾词完整归入左句),避免把句尾半个词切掉(吞字)
+ * @param {string} [granularity] 字幕粒度:'word' | 'sentence'(默认)
  * @returns {Array<{index, begin, end}>} 每句在整段音频内的时间区间(秒);无法对齐返回 null
  */
-function alignSegments(chunk, subtitles) {
+function alignSegments(chunk, subtitles, granularity) {
   if (!subtitles || !subtitles.length) return null;
   const norm = (s) => (s || '').replace(/\s+/g, '');
 
@@ -393,10 +396,18 @@ function alignSegments(chunk, subtitles) {
   }
   if (!totalSub) return null;
 
+  const wordLevel = granularity === 'word';
   const timeAt = (pos) => {
-    const p = Math.max(0, Math.min(pos, totalSub - 1e-6));
+    // 起点特判:整段音频的开始
+    if (pos <= 0) return entries[0].begin;
+    // 向左缩一个 epsilon:边界位置恰在某条起点时应归属上一条
+    // (否则词级对齐会把下一句的首词错误并进上一句)
+    const p = Math.min(pos - 1e-6, totalSub - 1e-6);
     for (const e of entries) {
       if (p < e.acc + e.len) {
+        // 词级:边界对齐到词结束(句尾词完整保留,不切词内)
+        if (wordLevel) return e.end;
+        // 句级:句内按字符比例插值
         return e.begin + (e.end - e.begin) * ((p - e.acc) / e.len);
       }
     }
